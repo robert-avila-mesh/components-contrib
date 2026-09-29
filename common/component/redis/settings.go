@@ -33,6 +33,7 @@ import (
 
 const (
 	defaultRedisPort               = "6379"
+	defaultRedisDialTimeout        = 5 * time.Second
 	entraIDCredentialRefreshWindow = 5 * time.Minute
 	entraIDMaxConnAge              = 4 * time.Minute
 	entraIDConnExpirySafetyMargin  = 30 * time.Second
@@ -138,7 +139,10 @@ type Settings struct {
 
 	// entraIDTokenCredential is the Azure SDK credential used to acquire fresh Entra access
 	// tokens on demand.
-	entraIDTokenCredential    *azcore.TokenCredential
+	entraIDTokenCredential *azcore.TokenCredential
+	// The gate serializes credential calls and lets callers cancel while they wait.
+	entraIDCredentialGateOnce sync.Once
+	entraIDCredentialGate     chan struct{}
 	entraIDLogger             *kitlogger.Logger
 	entraIDLifecycleMu        sync.Mutex
 	entraIDCurrentExpiry      int64
@@ -172,6 +176,23 @@ func (s *Settings) EntraIDFetchAuthArgs(
 	if s.entraIDTokenCredential == nil {
 		return "", "", 0, attempt, errors.New("redis client: EntraID credential not initialized")
 	}
+	gate := s.entraIDTokenGate()
+	select {
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
+	case <-ctx.Done():
+		if s.entraIDLogger != nil {
+			(*s.entraIDLogger).Warnf(
+				"event=redis_entra_token_acquisition outcome=failed phase=credential_wait auth_attempt=%d error_type=%T",
+				attempt, ctx.Err(),
+			)
+		}
+		return "", "", 0, attempt, fmt.Errorf("redis client: waiting for EntraID credential timed out: %w", ctx.Err())
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", 0, attempt, fmt.Errorf("redis client: EntraID authentication timed out before token acquisition: %w", err)
+	}
+	// Azure credentials are called synchronously. Their GetToken implementation must honor ctx.
 	tok, err := (*s.entraIDTokenCredential).GetToken(ctx, policy.TokenRequestOptions{
 		Scopes: []string{"https://redis.azure.com/.default"},
 	})
@@ -184,26 +205,44 @@ func (s *Settings) EntraIDFetchAuthArgs(
 		}
 		return "", "", 0, attempt, fmt.Errorf("failed to acquire EntraID token for redis AUTH: %w", err)
 	}
-	generation, _, previousStats := s.recordEntraIDToken(tok.ExpiresOn)
 	maxConnAge := s.effectiveMaxConnAge()
 	if err := validateEntraIDTokenLifetime(tok.ExpiresOn, time.Now(), maxConnAge); err != nil {
 		if s.entraIDLogger != nil {
 			(*s.entraIDLogger).Warnf(
-				"event=redis_entra_token_acquisition outcome=rejected token_generation=%d auth_attempt=%d remaining=%s max_conn_age=%s",
-				generation, attempt, time.Until(tok.ExpiresOn).Round(time.Second), maxConnAge,
+				"event=redis_entra_token_acquisition outcome=rejected auth_attempt=%d expires_at=%s remaining=%s max_conn_age=%s",
+				attempt, tok.ExpiresOn.UTC().Format(time.RFC3339), time.Until(tok.ExpiresOn).Round(time.Second), maxConnAge,
 			)
 		}
-		return "", "", generation, attempt, err
+		return "", "", 0, attempt, err
 	}
-	if s.markEntraIDTokenAccepted(generation) && s.entraIDLogger != nil {
+	generation, accepted, previousStats := s.acceptEntraIDToken(tok.ExpiresOn)
+	if accepted && s.entraIDLogger != nil {
 		(*s.entraIDLogger).Infof(
 			"event=redis_entra_token_acquisition outcome=accepted token_generation=%d expires_at=%s max_conn_age=%s prior_auth_attempts=%d prior_auth_acknowledgements=%d prior_auth_failures=%d",
 			generation, tok.ExpiresOn.UTC().Format(time.RFC3339), maxConnAge,
 			previousStats.attempted, previousStats.acknowledged, previousStats.failed,
 		)
 	}
-	s.recordEntraIDTokenAttempt(generation)
 	return s.entraIDUsername, tok.Token, generation, attempt, nil
+}
+
+func (s *Settings) entraIDAuthContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	// The callback uses this context for both token acquisition and the AUTH acknowledgment.
+	return context.WithTimeout(ctx, s.effectiveDialTimeout())
+}
+
+func (s *Settings) effectiveDialTimeout() time.Duration {
+	if timeout := time.Duration(s.DialTimeout); timeout > 0 {
+		return timeout
+	}
+	return defaultRedisDialTimeout
+}
+
+func (s *Settings) entraIDTokenGate() chan struct{} {
+	s.entraIDCredentialGateOnce.Do(func() {
+		s.entraIDCredentialGate = make(chan struct{}, 1)
+	})
+	return s.entraIDCredentialGate
 }
 
 func (s *Settings) nextEntraIDAuthAttempt() uint64 {
@@ -213,57 +252,44 @@ func (s *Settings) nextEntraIDAuthAttempt() uint64 {
 	return s.entraIDAuthAttempt
 }
 
-func (s *Settings) recordEntraIDToken(expiresOn time.Time) (uint64, bool, entraIDAuthStats) {
+func (s *Settings) acceptEntraIDToken(expiresOn time.Time) (uint64, bool, entraIDAuthStats) {
 	s.entraIDLifecycleMu.Lock()
 	defer s.entraIDLifecycleMu.Unlock()
-	expiryKey := expiresOn.UnixNano()
-	if expiryKey == s.entraIDCurrentExpiry {
-		return s.entraIDCurrentGeneration, false, entraIDAuthStats{}
-	}
-	if expiryKey == s.entraIDPreviousExpiry {
-		return s.entraIDPreviousGeneration, false, entraIDAuthStats{}
-	}
-	if s.entraIDCurrentGeneration == 0 {
-		s.entraIDCurrentGeneration = 1
-		s.entraIDCurrentExpiry = expiryKey
-		return s.entraIDCurrentGeneration, true, entraIDAuthStats{}
-	}
-	previousStats := s.entraIDCurrentAuthStats
-	s.entraIDPreviousExpiry = s.entraIDCurrentExpiry
-	s.entraIDPreviousGeneration = s.entraIDCurrentGeneration
-	s.entraIDPreviousAuthStats = previousStats
-	s.entraIDPreviousAccepted = s.entraIDCurrentAccepted
-	s.entraIDCurrentGeneration++
-	s.entraIDCurrentExpiry = expiryKey
-	s.entraIDCurrentAuthStats = entraIDAuthStats{}
-	s.entraIDCurrentAccepted = false
-	return s.entraIDCurrentGeneration, true, previousStats
-}
 
-func (s *Settings) markEntraIDTokenAccepted(generation uint64) bool {
-	s.entraIDLifecycleMu.Lock()
-	defer s.entraIDLifecycleMu.Unlock()
+	expiryKey := expiresOn.UnixNano()
+	if expiryKey != s.entraIDCurrentExpiry && expiryKey != s.entraIDPreviousExpiry {
+		if s.entraIDCurrentGeneration == 0 {
+			s.entraIDCurrentGeneration = 1
+			s.entraIDCurrentExpiry = expiryKey
+		} else {
+			s.entraIDPreviousExpiry = s.entraIDCurrentExpiry
+			s.entraIDPreviousGeneration = s.entraIDCurrentGeneration
+			s.entraIDPreviousAuthStats = s.entraIDCurrentAuthStats
+			s.entraIDPreviousAccepted = s.entraIDCurrentAccepted
+			s.entraIDCurrentGeneration++
+			s.entraIDCurrentExpiry = expiryKey
+			s.entraIDCurrentAuthStats = entraIDAuthStats{}
+			s.entraIDCurrentAccepted = false
+		}
+	}
+
+	generation := s.entraIDCurrentGeneration
 	accepted := &s.entraIDCurrentAccepted
-	if generation == s.entraIDPreviousGeneration {
+	if expiryKey == s.entraIDPreviousExpiry {
+		generation = s.entraIDPreviousGeneration
 		accepted = &s.entraIDPreviousAccepted
-	} else if generation != s.entraIDCurrentGeneration {
-		return false
+	}
+	stats := &s.entraIDCurrentAuthStats
+	if generation != s.entraIDCurrentGeneration {
+		stats = &s.entraIDPreviousAuthStats
 	}
 	if *accepted {
-		return false
+		stats.attempted++
+		return generation, false, entraIDAuthStats{}
 	}
 	*accepted = true
-	return true
-}
-
-func (s *Settings) recordEntraIDTokenAttempt(generation uint64) {
-	s.entraIDLifecycleMu.Lock()
-	defer s.entraIDLifecycleMu.Unlock()
-	if generation == s.entraIDCurrentGeneration {
-		s.entraIDCurrentAuthStats.attempted++
-	} else if generation == s.entraIDPreviousGeneration {
-		s.entraIDPreviousAuthStats.attempted++
-	}
+	stats.attempted++
+	return generation, true, s.entraIDPreviousAuthStats
 }
 
 func (s *Settings) recordEntraIDAuthResult(generation uint64, acknowledged bool) (uint64, bool) {

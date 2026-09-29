@@ -335,11 +335,13 @@ func (c v8Client) AuthACL(ctx context.Context, username, password string) error 
 // expired by the time the connection is opened.
 func entraIDOnConnectV8(s *Settings) func(ctx context.Context, cn *v8.Conn) error {
 	return func(ctx context.Context, cn *v8.Conn) error {
-		user, pass, generation, attempt, err := s.EntraIDFetchAuthArgs(ctx)
+		authCtx, cancel := s.entraIDAuthContext(ctx)
+		defer cancel()
+		user, pass, generation, attempt, err := s.EntraIDFetchAuthArgs(authCtx)
 		if err != nil {
 			return err
 		}
-		err = cn.AuthACL(ctx, user, pass).Err()
+		err = cn.AuthACL(authCtx, user, pass).Err()
 		if err != nil {
 			s.recordEntraIDAuthResult(generation, false)
 			if s.entraIDLogger != nil {
