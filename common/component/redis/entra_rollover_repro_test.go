@@ -32,6 +32,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	reproToken1 = "repro-token-1" // test-only: synthetic token for the local RESP server.
+	reproToken2 = "repro-token-2" // test-only: synthetic token for the local RESP server.
+)
+
 // TestEntraIDPoolRolloverRepro is a long-running integration test for the stale
 // credential behavior. Run it in a disposable pod with
 // REDIS_ENTRA_ROLLOVER_REPRO=1. It waits through the configured connection
@@ -55,10 +60,10 @@ type rolloverCredential struct {
 }
 
 func (c *rolloverCredential) GetToken(_ context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
-	token := "repro-token-1"
+	token := reproToken1
 	expiresOn := c.started.Add(5*time.Minute + 15*time.Second)
 	if time.Since(c.started) >= 3*time.Minute {
-		token = "repro-token-2"
+		token = reproToken2
 		expiresOn = c.started.Add(15 * time.Minute)
 	}
 	return azcore.AccessToken{Token: token, ExpiresOn: expiresOn}, nil
@@ -173,7 +178,7 @@ func serveRolloverRESP(conn net.Conn, expires time.Time, warmupPings *atomic.Int
 			if len(command) == 2 {
 				token = command[1]
 			}
-			if token == "repro-token-2" {
+			if token == reproToken2 {
 				token2Auths.Add(1)
 			}
 			_, _ = io.WriteString(conn, "+OK\r\n")
@@ -184,7 +189,7 @@ func serveRolloverRESP(conn net.Conn, expires time.Time, warmupPings *atomic.Int
 				}
 				<-warmupDone
 			}
-			if time.Now().After(expires) && token != "repro-token-2" {
+			if time.Now().After(expires) && token != reproToken2 {
 				expiredCloses.Add(1)
 				return
 			}
