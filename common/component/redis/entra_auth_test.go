@@ -55,11 +55,13 @@ func TestClampEntraIDMaxConnAge(t *testing.T) {
 }
 
 type deadlineCredential struct {
-	calls       atomic.Int32
-	slowFirst   bool
-	failFirst   bool
-	shortFirst  bool
-	tokenExpiry time.Time
+	calls        atomic.Int32
+	slowFirst    bool
+	failFirst    bool
+	shortFirst   bool
+	expiredFirst bool
+	zeroFirst    bool
+	tokenExpiry  time.Time
 }
 
 type blockingCredential struct {
@@ -138,12 +140,18 @@ func (c *deadlineCredential) GetToken(ctx context.Context, _ policy.TokenRequest
 	if c.shortFirst && call == 1 {
 		expiresOn = time.Now().Add(time.Second)
 	}
+	if c.expiredFirst && call == 1 {
+		expiresOn = time.Now().Add(-time.Second)
+	}
+	if c.zeroFirst && call == 1 {
+		expiresOn = time.Time{}
+	}
 	return azcore.AccessToken{Token: "test-token", ExpiresOn: expiresOn}, nil // test token, never sent to a real Redis server.
 }
 
 func TestEntraIDAuthTimeoutAndPoolRecovery(t *testing.T) {
 	for _, version := range []string{"v8", "v9"} {
-		for _, authStage := range []string{"credential timeout", "caller cancellation", "AUTH timeout", "credential error", "short token", "AUTH rejection"} {
+		for _, authStage := range []string{"credential timeout", "caller cancellation", "AUTH timeout", "credential error", "short token", "expired token", "missing expiry", "AUTH rejection"} {
 			t.Run(version+"/"+authStage, func(t *testing.T) {
 				listener, err := net.Listen("tcp", "127.0.0.1:0")
 				require.NoError(t, err)
@@ -191,10 +199,12 @@ func TestEntraIDAuthTimeoutAndPoolRecovery(t *testing.T) {
 				}()
 
 				credential := &deadlineCredential{
-					slowFirst:   authStage == "credential timeout" || authStage == "caller cancellation",
-					failFirst:   authStage == "credential error",
-					shortFirst:  authStage == "short token",
-					tokenExpiry: time.Now().Add(time.Hour),
+					slowFirst:    authStage == "credential timeout" || authStage == "caller cancellation",
+					failFirst:    authStage == "credential error",
+					shortFirst:   authStage == "short token",
+					expiredFirst: authStage == "expired token",
+					zeroFirst:    authStage == "missing expiry",
+					tokenExpiry:  time.Now().Add(time.Hour),
 				}
 				var logOutput bytes.Buffer
 				logger := kitlogger.NewLogger("redis-test")
@@ -230,7 +240,7 @@ func TestEntraIDAuthTimeoutAndPoolRecovery(t *testing.T) {
 				}
 				err = execTestPipelinePing(client, firstCtx)
 				require.Error(t, err, "the first connection authentication must fail")
-				if authStage == "credential error" || authStage == "short token" {
+				if authStage == "credential error" || authStage == "short token" || authStage == "expired token" || authStage == "missing expiry" {
 					require.Zero(t, authCommands.Load(), "rejected credentials must fail before AUTH")
 				}
 				require.NoError(t, execTestPipelinePing(client, ctx), "a later connection must authenticate and return to the pool")
