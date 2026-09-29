@@ -321,6 +321,9 @@ func (c v9Client) TTLResult(ctx context.Context, key string) (time.Duration, err
 func (c v9Client) AuthACL(ctx context.Context, username, password string) error {
 	pipeline := c.client.Pipeline()
 	statusCmd := pipeline.AuthACL(ctx, username, password)
+	if _, err := pipeline.Exec(ctx); err != nil {
+		return err
+	}
 	return statusCmd.Err()
 }
 
@@ -332,11 +335,36 @@ func (c v9Client) AuthACL(ctx context.Context, username, password string) error 
 // expired by the time the connection is opened.
 func entraIDOnConnectV9(s *Settings) func(ctx context.Context, cn *v9.Conn) error {
 	return func(ctx context.Context, cn *v9.Conn) error {
-		user, pass, err := s.EntraIDFetchAuthArgs(ctx)
+		user, pass, generation, attempt, err := s.EntraIDFetchAuthArgs(ctx)
 		if err != nil {
 			return err
 		}
-		return cn.AuthACL(ctx, user, pass).Err()
+		err = cn.AuthACL(ctx, user, pass).Err()
+		if err != nil {
+			s.recordEntraIDAuthResult(generation, false)
+			if s.entraIDLogger != nil {
+				(*s.entraIDLogger).Warnf(
+					"event=redis_entra_connection_auth outcome=failed token_generation=%d auth_attempt=%d error_type=%T",
+					generation, attempt, err,
+				)
+			}
+			return err
+		}
+		acknowledged, firstAck := s.recordEntraIDAuthResult(generation, true)
+		if s.entraIDLogger != nil {
+			if firstAck {
+				(*s.entraIDLogger).Infof(
+					"event=redis_entra_connection_auth outcome=server_acknowledged token_generation=%d auth_attempt=%d generation_acknowledgements=%d",
+					generation, attempt, acknowledged,
+				)
+			} else {
+				(*s.entraIDLogger).Debugf(
+					"event=redis_entra_connection_auth outcome=server_acknowledged token_generation=%d auth_attempt=%d generation_acknowledgements=%d",
+					generation, attempt, acknowledged,
+				)
+			}
+		}
+		return nil
 	}
 }
 
@@ -359,7 +387,7 @@ func newV9FailoverClient(s *Settings) (RedisClient, error) {
 		ReadTimeout:           time.Duration(s.ReadTimeout),
 		WriteTimeout:          time.Duration(s.WriteTimeout),
 		PoolSize:              s.PoolSize,
-		ConnMaxLifetime:       time.Duration(s.MaxConnAge),
+		ConnMaxLifetime:       s.effectiveMaxConnAge(),
 		MinIdleConns:          s.MinIdleConns,
 		PoolTimeout:           time.Duration(s.PoolTimeout),
 		ConnMaxIdleTime:       time.Duration(s.IdleTimeout),
@@ -421,7 +449,7 @@ func newV9Client(s *Settings) (RedisClient, error) {
 			ReadTimeout:           time.Duration(s.ReadTimeout),
 			WriteTimeout:          time.Duration(s.WriteTimeout),
 			PoolSize:              s.PoolSize,
-			ConnMaxLifetime:       time.Duration(s.MaxConnAge),
+			ConnMaxLifetime:       s.effectiveMaxConnAge(),
 			MinIdleConns:          s.MinIdleConns,
 			PoolTimeout:           time.Duration(s.PoolTimeout),
 			ConnMaxIdleTime:       time.Duration(s.IdleTimeout),
@@ -464,7 +492,7 @@ func newV9Client(s *Settings) (RedisClient, error) {
 		ReadTimeout:           time.Duration(s.ReadTimeout),
 		WriteTimeout:          time.Duration(s.WriteTimeout),
 		PoolSize:              s.PoolSize,
-		ConnMaxLifetime:       time.Duration(s.MaxConnAge),
+		ConnMaxLifetime:       s.effectiveMaxConnAge(),
 		MinIdleConns:          s.MinIdleConns,
 		PoolTimeout:           time.Duration(s.PoolTimeout),
 		ConnMaxIdleTime:       time.Duration(s.IdleTimeout),
