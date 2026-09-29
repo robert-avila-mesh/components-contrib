@@ -102,6 +102,7 @@ func runEntraIDPoolRolloverRepro(t *testing.T, version string) {
 		DialTimeout:     Duration(5 * time.Second),
 		ReadTimeout:     Duration(5 * time.Second),
 		WriteTimeout:    Duration(5 * time.Second),
+		IdleTimeout:     Duration(10 * time.Minute),
 		UseEntraID:      true,
 		entraIDUsername: "repro-user",
 	}
