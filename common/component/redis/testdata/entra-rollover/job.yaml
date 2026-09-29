@@ -1,0 +1,18 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-entra-rollover
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 420
+  ttlSecondsAfterFinished: 1800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: repro
+          image: redis-entra-repro:fixed
+          imagePullPolicy: Never
+          env:
+            - name: REDIS_ENTRA_ROLLOVER_REPRO
+              value: "1"
