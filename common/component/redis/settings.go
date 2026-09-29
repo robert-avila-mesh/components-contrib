@@ -21,15 +21,22 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 
 	"github.com/dapr/kit/config"
+	kitlogger "github.com/dapr/kit/logger"
 )
 
-const defaultRedisPort = "6379"
+const (
+	defaultRedisPort               = "6379"
+	entraIDCredentialRefreshWindow = 5 * time.Minute
+	entraIDMaxConnAge              = 4 * time.Minute
+	entraIDConnExpirySafetyMargin  = 30 * time.Second
+)
 
 type Settings struct {
 	// The Redis host
@@ -70,8 +77,7 @@ type Settings struct {
 	// Minimum number of idle connections which is useful when establishing
 	// new connection is slow.
 	MinIdleConns int `mapstructure:"minIdleConns"`
-	// Connection age at which client retires (closes) the connection.
-	// Default is to not close aged connections.
+	// Maximum connection age. go-redis expires aged connections lazily before reuse.
 	MaxConnAge Duration `mapstructure:"maxConnAge"`
 	// Amount of time client waits for connection if all connections
 	// are busy before returning an error.
@@ -127,14 +133,29 @@ type Settings struct {
 	// == Entra ID runtime state (populated by InitEntraIDCredential when UseEntraID is true; not configurable via metadata) ==
 
 	// entraIDUsername is the OID parsed from the initial Entra access token's "oid" claim.
-	// Used as the Redis ACL username by both the per-new-connection AUTH (OnConnect) and the
-	// periodic AUTH ACL refresh goroutine.
+	// Used as the Redis ACL username by the per-new-connection AUTH callback.
 	entraIDUsername string
 
 	// entraIDTokenCredential is the Azure SDK credential used to acquire fresh Entra access
-	// tokens on demand. The credential implementation caches tokens until close to expiry,
-	// so calling GetToken on every new pool connection is inexpensive in steady state.
-	entraIDTokenCredential *azcore.TokenCredential
+	// tokens on demand.
+	entraIDTokenCredential    *azcore.TokenCredential
+	entraIDLogger             *kitlogger.Logger
+	entraIDLifecycleMu        sync.Mutex
+	entraIDCurrentExpiry      int64
+	entraIDPreviousExpiry     int64
+	entraIDCurrentGeneration  uint64
+	entraIDPreviousGeneration uint64
+	entraIDCurrentAccepted    bool
+	entraIDPreviousAccepted   bool
+	entraIDCurrentAuthStats   entraIDAuthStats
+	entraIDPreviousAuthStats  entraIDAuthStats
+	entraIDAuthAttempt        uint64
+}
+
+type entraIDAuthStats struct {
+	attempted    uint64
+	acknowledged uint64
+	failed       uint64
 }
 
 // EntraIDFetchAuthArgs returns the Redis ACL username and a freshly-acquired Entra access
@@ -144,17 +165,148 @@ type Settings struct {
 // This is invoked from the OnConnect callback installed on the underlying go-redis client
 // so that every new pool connection authenticates with a current token, rather than the
 // stale snapshot Password that would otherwise be sent during initial AUTH.
-func (s *Settings) EntraIDFetchAuthArgs(ctx context.Context) (username, password string, err error) {
+func (s *Settings) EntraIDFetchAuthArgs(
+	ctx context.Context,
+) (username, password string, generation, attempt uint64, err error) {
+	attempt = s.nextEntraIDAuthAttempt()
 	if s.entraIDTokenCredential == nil {
-		return "", "", errors.New("redis client: EntraID credential not initialized")
+		return "", "", 0, attempt, errors.New("redis client: EntraID credential not initialized")
 	}
 	tok, err := (*s.entraIDTokenCredential).GetToken(ctx, policy.TokenRequestOptions{
 		Scopes: []string{"https://redis.azure.com/.default"},
 	})
 	if err != nil {
-		return "", "", fmt.Errorf("failed to acquire EntraID token for redis AUTH: %w", err)
+		if s.entraIDLogger != nil {
+			(*s.entraIDLogger).Warnf(
+				"event=redis_entra_token_acquisition outcome=failed auth_attempt=%d error_type=%T",
+				attempt, err,
+			)
+		}
+		return "", "", 0, attempt, fmt.Errorf("failed to acquire EntraID token for redis AUTH: %w", err)
 	}
-	return s.entraIDUsername, tok.Token, nil
+	generation, _, previousStats := s.recordEntraIDToken(tok.ExpiresOn)
+	maxConnAge := s.effectiveMaxConnAge()
+	if err := validateEntraIDTokenLifetime(tok.ExpiresOn, time.Now(), maxConnAge); err != nil {
+		if s.entraIDLogger != nil {
+			(*s.entraIDLogger).Warnf(
+				"event=redis_entra_token_acquisition outcome=rejected token_generation=%d auth_attempt=%d remaining=%s max_conn_age=%s",
+				generation, attempt, time.Until(tok.ExpiresOn).Round(time.Second), maxConnAge,
+			)
+		}
+		return "", "", generation, attempt, err
+	}
+	if s.markEntraIDTokenAccepted(generation) && s.entraIDLogger != nil {
+		(*s.entraIDLogger).Infof(
+			"event=redis_entra_token_acquisition outcome=accepted token_generation=%d expires_at=%s max_conn_age=%s prior_auth_attempts=%d prior_auth_acknowledgements=%d prior_auth_failures=%d",
+			generation, tok.ExpiresOn.UTC().Format(time.RFC3339), maxConnAge,
+			previousStats.attempted, previousStats.acknowledged, previousStats.failed,
+		)
+	}
+	s.recordEntraIDTokenAttempt(generation)
+	return s.entraIDUsername, tok.Token, generation, attempt, nil
+}
+
+func (s *Settings) nextEntraIDAuthAttempt() uint64 {
+	s.entraIDLifecycleMu.Lock()
+	defer s.entraIDLifecycleMu.Unlock()
+	s.entraIDAuthAttempt++
+	return s.entraIDAuthAttempt
+}
+
+func (s *Settings) recordEntraIDToken(expiresOn time.Time) (uint64, bool, entraIDAuthStats) {
+	s.entraIDLifecycleMu.Lock()
+	defer s.entraIDLifecycleMu.Unlock()
+	expiryKey := expiresOn.UnixNano()
+	if expiryKey == s.entraIDCurrentExpiry {
+		return s.entraIDCurrentGeneration, false, entraIDAuthStats{}
+	}
+	if expiryKey == s.entraIDPreviousExpiry {
+		return s.entraIDPreviousGeneration, false, entraIDAuthStats{}
+	}
+	if s.entraIDCurrentGeneration == 0 {
+		s.entraIDCurrentGeneration = 1
+		s.entraIDCurrentExpiry = expiryKey
+		return s.entraIDCurrentGeneration, true, entraIDAuthStats{}
+	}
+	previousStats := s.entraIDCurrentAuthStats
+	s.entraIDPreviousExpiry = s.entraIDCurrentExpiry
+	s.entraIDPreviousGeneration = s.entraIDCurrentGeneration
+	s.entraIDPreviousAuthStats = previousStats
+	s.entraIDPreviousAccepted = s.entraIDCurrentAccepted
+	s.entraIDCurrentGeneration++
+	s.entraIDCurrentExpiry = expiryKey
+	s.entraIDCurrentAuthStats = entraIDAuthStats{}
+	s.entraIDCurrentAccepted = false
+	return s.entraIDCurrentGeneration, true, previousStats
+}
+
+func (s *Settings) markEntraIDTokenAccepted(generation uint64) bool {
+	s.entraIDLifecycleMu.Lock()
+	defer s.entraIDLifecycleMu.Unlock()
+	accepted := &s.entraIDCurrentAccepted
+	if generation == s.entraIDPreviousGeneration {
+		accepted = &s.entraIDPreviousAccepted
+	} else if generation != s.entraIDCurrentGeneration {
+		return false
+	}
+	if *accepted {
+		return false
+	}
+	*accepted = true
+	return true
+}
+
+func (s *Settings) recordEntraIDTokenAttempt(generation uint64) {
+	s.entraIDLifecycleMu.Lock()
+	defer s.entraIDLifecycleMu.Unlock()
+	if generation == s.entraIDCurrentGeneration {
+		s.entraIDCurrentAuthStats.attempted++
+	} else if generation == s.entraIDPreviousGeneration {
+		s.entraIDPreviousAuthStats.attempted++
+	}
+}
+
+func (s *Settings) recordEntraIDAuthResult(generation uint64, acknowledged bool) (uint64, bool) {
+	s.entraIDLifecycleMu.Lock()
+	defer s.entraIDLifecycleMu.Unlock()
+	stats := &s.entraIDCurrentAuthStats
+	if generation == s.entraIDPreviousGeneration {
+		stats = &s.entraIDPreviousAuthStats
+	} else if generation != s.entraIDCurrentGeneration {
+		return 0, false
+	}
+	if acknowledged {
+		stats.acknowledged++
+	} else {
+		stats.failed++
+	}
+	return stats.acknowledged, stats.acknowledged == 1
+}
+
+func clampEntraIDMaxConnAge(configured time.Duration) time.Duration {
+	if configured <= 0 || configured > entraIDMaxConnAge {
+		return entraIDMaxConnAge
+	}
+	return configured
+}
+
+func (s *Settings) effectiveMaxConnAge() time.Duration {
+	configured := time.Duration(s.MaxConnAge)
+	if s.UseEntraID {
+		return clampEntraIDMaxConnAge(configured)
+	}
+	return configured
+}
+
+func validateEntraIDTokenLifetime(expiresOn, now time.Time, maxConnAge time.Duration) error {
+	minimumLifetime := maxConnAge + entraIDConnExpirySafetyMargin
+	if minimumLifetime >= entraIDCredentialRefreshWindow {
+		return errors.New("redis client: EntraID maxConnAge exceeds the credential refresh window")
+	}
+	if !expiresOn.After(now.Add(minimumLifetime)) {
+		return errors.New("redis client: EntraID token lifetime does not cover maxConnAge and safety margin")
+	}
+	return nil
 }
 
 func (s *Settings) Decode(in interface{}) error {

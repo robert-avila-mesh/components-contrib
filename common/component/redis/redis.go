@@ -23,7 +23,6 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/cenkalti/backoff/v4"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"golang.org/x/mod/semver"
 
@@ -31,7 +30,6 @@ import (
 	"github.com/dapr/components-contrib/configuration"
 	"github.com/dapr/components-contrib/metadata"
 	kitlogger "github.com/dapr/kit/logger"
-	kitretry "github.com/dapr/kit/retry"
 )
 
 const (
@@ -165,12 +163,23 @@ func ParseClientFromProperties(properties map[string]string, componentType metad
 			// if there was an error we would try to interpret it as a duration string, which was already done in Decode()
 		}
 	}
-	var tokenExpires *time.Time
-	var tokenCredential *azcore.TokenCredential
 	if settings.UseEntraID {
-		tokenExpires, tokenCredential, err = settings.InitEntraIDCredential(ctx, &properties)
-		if err != nil {
+		settings.entraIDLogger = logger
+		if _, _, err = settings.InitEntraIDCredential(ctx, &properties); err != nil {
 			return nil, nil, err
+		}
+		configuredAge := time.Duration(settings.MaxConnAge)
+		settings.MaxConnAge = Duration(settings.effectiveMaxConnAge())
+		if configuredAge != time.Duration(settings.MaxConnAge) {
+			(*logger).Infof(
+				"event=redis_entra_pool_lifecycle outcome=max_conn_age_clamped configured=%s effective=%s",
+				configuredAge, time.Duration(settings.MaxConnAge),
+			)
+		} else {
+			(*logger).Infof(
+				"event=redis_entra_pool_lifecycle outcome=configured max_conn_age=%s",
+				time.Duration(settings.MaxConnAge),
+			)
 		}
 	}
 
@@ -211,104 +220,15 @@ func ParseClientFromProperties(properties map[string]string, componentType metad
 		return nil, nil, fmt.Errorf("redis client configuration error: %w", err)
 	}
 
-	// start the token refresh goroutine — keeps long-lived connections re-AUTHed via AUTH ACL
-	// before the prior token expires. This is complementary to the OnConnect hook that handles
-	// brand-new pool connections.
-
-	if settings.UseEntraID {
-		StartEntraIDTokenRefreshBackgroundRoutine(c, settings.entraIDUsername, *tokenExpires, tokenCredential, logger)
-	}
 	return c, &settings, nil
-}
-
-func StartEntraIDTokenRefreshBackgroundRoutine(client RedisClient, username string, nextExpiration time.Time, cred *azcore.TokenCredential, logger *kitlogger.Logger) {
-	go func(cred *azcore.TokenCredential, username string, logger *kitlogger.Logger) {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		backoffConfig := kitretry.DefaultConfig()
-		backoffConfig.MaxRetries = 3
-		backoffConfig.Policy = kitretry.PolicyExponential
-
-		var backoffManager backoff.BackOff
-		const refreshGracePeriod = 5 * time.Minute
-		tokenRefreshDuration := time.Until(nextExpiration.Add(-refreshGracePeriod))
-
-		(*logger).Debugf("redis client: starting entraID token refresh loop")
-
-		for {
-			(*logger).Debugf("redis client: next entraID token refresh: %v", tokenRefreshDuration)
-			select {
-			case <-ctx.Done():
-				(*logger).Infof("redis client: entraID token refresh stopped due to context cancellation")
-				return
-			case <-time.After(tokenRefreshDuration):
-				(*logger).Debug("redis client: refreshing entraID token")
-				// Get a new access token
-				backoffManager = backoffConfig.NewBackOffWithContext(ctx)
-				var token azcore.AccessToken
-				tokenErr := kitretry.NotifyRecover(
-					func() error {
-						var innerTokenErr error
-						token, innerTokenErr = (*cred).GetToken(ctx, policy.TokenRequestOptions{
-							Scopes: []string{"https://redis.azure.com/.default"},
-						})
-						return innerTokenErr
-					},
-					backoffManager,
-					func(err error, _ time.Duration) {
-						(*logger).Debugf("redis client: entraID token acquisition failed with error: %v. Retrying...", err)
-					},
-					func() {
-						(*logger).Debug("redis client: entraID token acquisition succeeded after error")
-					},
-				)
-				if tokenErr != nil {
-					_ = client.Close()
-					(*logger).Fatalf("redis client: entraID token acquisition failed: %v", tokenErr)
-					return
-				}
-
-				// Use the new access token via the Redis AUTH command
-				backoffManager = backoffConfig.NewBackOffWithContext(ctx)
-				authErr := kitretry.NotifyRecover(
-					func() error {
-						var innerAuthErr error
-						innerAuthErr = client.AuthACL(ctx, username, token.Token)
-						return innerAuthErr
-					},
-					backoffManager,
-					func(err error, _ time.Duration) {
-						(*logger).Debugf("redis client: entraID auth failed with error: %v. Retrying...", err)
-					},
-					func() {
-						(*logger).Debug("redis client: entraID auth succeeded after error")
-					},
-				)
-				if authErr != nil {
-					_ = client.Close()
-					(*logger).Fatalf("redis client: entraID auth failed: %v", authErr)
-					return
-				}
-				// Since the entraID auth succeeded we are setting the duration to wait for the next iteration of the refresh loop
-
-				(*logger).Debugf("redis client: entraID auth token successfully refreshed with the server")
-
-				tokenRefreshDuration = time.Until(token.ExpiresOn.Add(-refreshGracePeriod))
-			}
-		}
-	}(cred, username, logger)
 }
 
 // InitEntraIDCredential validates Entra ID configuration, acquires the Azure SDK token
 // credential, and parses the initial access token's "oid" claim to derive the Redis ACL
 // username. The credential and OID are stored on the Settings as unexported fields for
-// later use by:
-//
-//  1. The OnConnect hook installed on the underlying go-redis client (see v8client.go /
-//     v9client.go), which AUTHs every newly-dialed pool connection with a freshly-acquired
-//     token.
-//  2. StartEntraIDTokenRefreshBackgroundRoutine, which periodically re-AUTHs existing
-//     long-lived connections via AUTH ACL before the prior token expires.
+// later use by the OnConnect hook and bounded connection lifetime. The pool expires
+// aged connections lazily before reuse, and the AUTH callback rejects tokens that do
+// not cover the configured age and safety margin.
 //
 // In contrast to the previous behavior of this function (which snapshot the initial token
 // into Settings.Password), nothing is written to Settings.Username or Settings.Password.
@@ -317,8 +237,7 @@ func StartEntraIDTokenRefreshBackgroundRoutine(client RedisClient, username stri
 // since expired — and Redis returns WRONGPASS. The OnConnect hook fixes this by always
 // fetching a fresh token at connect time.
 //
-// Returns the initial token's expiration (used to schedule the first refresh) and the
-// credential pointer (used by the refresh goroutine to acquire later tokens).
+// Returns the initial token's expiration and credential for existing callers.
 func (s *Settings) InitEntraIDCredential(ctx context.Context, properties *map[string]string) (*time.Time, *azcore.TokenCredential, error) {
 	if len(s.Password) > 0 || len(s.Username) > 0 {
 		return nil, nil, errors.New(
